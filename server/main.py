@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -89,6 +90,8 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float = 0.0
+    category: str = "Parts"
 
 class BacklogItem(BaseModel):
     id: str
@@ -119,6 +122,26 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float = 0.0
+    category: str = "Parts"
+
+class CreateRestockOrderRequest(BaseModel):
+    items: List[RestockItem]
+    warehouse: str = "San Francisco"
+
+# Lead time in days by category; default 14 days
+LEAD_TIME_DAYS = {
+    "Power Supplies": 7,
+    "Circuit Boards": 7,
+    "Sensors": 10,
+    "Controllers": 10,
+    "Machinery": 21,
+}
 
 # API endpoints
 @app.get("/")
@@ -303,6 +326,52 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.post("/api/orders/restock", response_model=Order)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Create a restocking order from selected demand forecast items"""
+    if not request.items:
+        raise HTTPException(status_code=400, detail="No items provided")
+
+    # Determine lead time from the longest-lead-time category in the order
+    max_lead = max(LEAD_TIME_DAYS.get(item.category, 14) for item in request.items)
+
+    now = datetime.utcnow()
+    expected = now + timedelta(days=max_lead)
+
+    # Enrich unit costs from inventory where available
+    inventory_by_sku = {inv["sku"]: inv["unit_cost"] for inv in inventory_items}
+
+    order_items = []
+    total_value = 0.0
+    for item in request.items:
+        unit_price = inventory_by_sku.get(item.sku, item.unit_cost)
+        line_total = unit_price * item.quantity
+        total_value += line_total
+        order_items.append({
+            "sku": item.sku,
+            "name": item.name,
+            "quantity": item.quantity,
+            "unit_price": unit_price,
+        })
+
+    new_id = str(len(orders) + 1)
+    new_order = {
+        "id": new_id,
+        "order_number": f"RST-{len(orders) + 1:04d}",
+        "customer": "Internal Restock",
+        "items": order_items,
+        "status": "Processing",
+        "warehouse": request.warehouse,
+        "category": request.items[0].category if len(request.items) == 1 else "Mixed",
+        "order_date": now.strftime("%Y-%m-%dT%H:%M:%S"),
+        "expected_delivery": expected.strftime("%Y-%m-%dT%H:%M:%S"),
+        "total_value": round(total_value, 2),
+        "actual_delivery": None,
+    }
+    orders.append(new_order)
+    return new_order
+
 
 if __name__ == "__main__":
     import uvicorn
